@@ -17,6 +17,8 @@ within the schematic given in the PDF (Schematic v1.0).
 - [IR Tx/Rx Connectors & Mux](#ir-txrx-connectors--mux)  
 - [Stepper Motor Driver Connectors](#stepper-motor-driver-connectors)
 
+[Changes](#changes)
+
 ## ESP32-S3-WROOM1-N4 SoM Config
 
 The blocks on the left side of the schematic are all part of the ESP32
@@ -217,6 +219,7 @@ level power, the Dir signal, and the Step signal.
 The power for the motors will come straight from the battery, as it's
 better not to pass high amounts of current through PCB traces.
 
+# Changes
 
 # Schematic v1.1 Changes Breakdown
 This README.md contains a the changes since the last version of the schematic.
