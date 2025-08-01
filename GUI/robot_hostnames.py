@@ -1,0 +1,1 @@
+robots = ["http://esp32_s3_1.local", "http://esp32_s3_2.local", "http://esp32_s3_3.local"]
