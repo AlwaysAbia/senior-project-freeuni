@@ -36,7 +36,7 @@ ctk.CTkLabel(state_frame, text="Update State", font=ctk.CTkFont(size=14, weight=
 
 def send_update_state():
     selected_index = int(robot_dropdown.get()) - 1
-    base_url = f"{robots[selected_index]}/update_state"
+    base_url = f"{robots[selected_index]}/updateState"
 
     state = state_dropdown.get()
     params = {"mode": state}
