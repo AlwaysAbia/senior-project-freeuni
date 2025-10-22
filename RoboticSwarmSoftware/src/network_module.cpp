@@ -1,14 +1,17 @@
 #include <Wifi.h>
-#include <WebServer.h>
 #include <ArduinoOTA.h>
 #include <ArduinoJson.h>
+#include <PubSubClient.h>
 
 #include "network_module.hpp"
 #include "network_credentials.hpp"
 #include "motor_module.hpp"
 #include "globals.hpp"
 
-WebServer server(80);
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+String lastReceivedMessage = "";
 
 //-----------------------------------------------
 // Setup Functions
@@ -63,143 +66,241 @@ void connectToHub() {
 }
 
 //-----------------------------------------------
-// HTTP Request Handler Functions
-void handleUpdateState() {
-  bool updated = false;
-  String msg = "Updated: ";
-
-  // --- Mode selection ---
-  if (server.hasArg("mode")) {
-    String modeStr = server.arg("mode");
-    if      (modeStr == "OFF")     state.mode = State::OFF;
-    else if (modeStr == "IDLE")    state.mode = State::IDLE;
-    else if (modeStr == "LINE")    state.mode = State::LINE;
-    else if (modeStr == "POLYGON") state.mode = State::POLYGON;
-    else if (modeStr == "MANUAL")  state.mode = State::MANUAL;
-    else {
-      server.send(400, "text/plain", "Invalid mode");
-      return;
-    }
-    updated = true;
-    msg += "mode ";
+// MQTT Helper & Core Functions
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String message = "";
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
   }
-
-  // --- Common / General Config ---
-  if (server.hasArg("neighbor_maxDist")) {
-    state.neighbor_maxDist = server.arg("neighbor_maxDist").toInt();
-    updated = true;
-    msg += "neighbor_maxDist ";
-  }
-
-  // --- Idle mode ---
-  if (server.hasArg("idle_thresh")) {
-    state.idle_thresh = server.arg("idle_thresh").toInt();
-    updated = true;
-    msg += "idle_thresh ";
-  }
-
-  // --- Line mode ---
-  if (server.hasArg("line_nodeDist")) {
-    state.line_nodeDist = server.arg("line_nodeDist").toInt();
-    updated = true;
-    msg += "line_nodeDist ";
-  }
-
-  if (server.hasArg("line_alignTol")) {
-    state.line_alignTol = server.arg("line_alignTol").toInt();
-    updated = true;
-    msg += "line_alignTol ";
-  }
-
-  // --- Polygon mode ---
-  if (server.hasArg("polygon_sides")) {
-    state.polygon_sides = server.arg("polygon_sides").toInt();
-    updated = true;
-    msg += "polygon_sides ";
-  }
-
-  if (server.hasArg("polygon_radius")) {
-    state.polygon_radius = server.arg("polygon_radius").toInt();
-    updated = true;
-    msg += "polygon_radius ";
-  }
-
-  if (server.hasArg("polygon_alignTol")) {
-    state.polygon_alignTol = server.arg("polygon_alignTol").toInt();
-    updated = true;
-    msg += "polygon_alignTol ";
-  }
-
-  if (updated)
-    server.send(200, "text/plain", msg + "successfully");
-  else
-    server.send(400, "text/plain", "No valid parameters provided");
-}
-
-void handleMove() {
-  int l = server.hasArg("l") ? server.arg("l").toInt() : 0;
-  int r = server.hasArg("r") ? server.arg("r").toInt() : 0;
-  int b = server.hasArg("b") ? server.arg("b").toInt() : 0;
-
-  if (l == 0 && r == 0 && b == 0) {
-    server.send(400, "text/plain", "At least one of l, r, or b must be non-zero");
+  
+  String topicStr = String(topic);
+  
+  // Check if topic is broadcast or matches my robot ID
+  bool isBroadcast = topicStr.equals("command/broadcast");
+  bool isMyCommand = topicStr.startsWith("command/individual/") && topicStr.endsWith(hostname);
+  
+  if (!isBroadcast && !isMyCommand) {
     return;
   }
-  if(state.mode == State::MANUAL){
-    setMotorSteps(l, r, b);
-    server.send(200, "text/plain",
-      "Motor steps set: L=" + String(l) + ", R=" + String(r) + ", B=" + String(b));
+  
+  // Deduplication
+  if (message.equals(lastReceivedMessage)) {
+    Serial.println("Duplicate message, ignoring");
+    return;
+  }
+  lastReceivedMessage = message;
+  
+  Serial.print("Received command: ");
+  Serial.println(message);
+  
+  // Parse JSON (outside mutex)
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, message);
+  
+  if (error) {
+    Serial.print("JSON parse failed: ");
+    Serial.println(error.c_str());
+    return;
+  }
+  
+  // Extract values to local variables (outside mutex)
+  bool hasMode = !doc["mode"].isNull();
+  State::Mode newMode = State::OFF;
+  if (hasMode) {
+    const char* mode = doc["mode"];
+    if (strcmp(mode, "OFF") == 0) newMode = State::OFF;
+    else if (strcmp(mode, "IDLE") == 0) newMode = State::IDLE;
+    else if (strcmp(mode, "LINE") == 0) newMode = State::LINE;
+    else if (strcmp(mode, "POLYGON") == 0) newMode = State::POLYGON;
+    else if (strcmp(mode, "MANUAL") == 0) newMode = State::MANUAL;
+  }
+  
+  bool hasNeighborMaxDist = !doc["neighbor_maxDist"].isNull();
+  uint16_t newNeighborMaxDist = hasNeighborMaxDist ? doc["neighbor_maxDist"].as<uint16_t>() : 0;
+  
+  bool hasIdleThresh = !doc["idle_thresh"].isNull();
+  uint16_t newIdleThresh = hasIdleThresh ? doc["idle_thresh"].as<uint16_t>() : 0;
+  
+  bool hasLineNodeDist = !doc["line_nodeDist"].isNull();
+  uint16_t newLineNodeDist = hasLineNodeDist ? doc["line_nodeDist"].as<uint16_t>() : 0;
+  
+  bool hasLineAlignTol = !doc["line_alignTol"].isNull();
+  uint16_t newLineAlignTol = hasLineAlignTol ? doc["line_alignTol"].as<uint16_t>() : 0;
+  
+  bool hasPolygonSides = !doc["polygon_sides"].isNull();
+  uint8_t newPolygonSides = hasPolygonSides ? doc["polygon_sides"].as<uint8_t>() : 0;
+  
+  bool hasPolygonRadius = !doc["polygon_radius"].isNull();
+  uint16_t newPolygonRadius = hasPolygonRadius ? doc["polygon_radius"].as<uint16_t>() : 0;
+  
+  bool hasPolygonAlignTol = !doc["polygon_alignTol"].isNull();
+  uint16_t newPolygonAlignTol = hasPolygonAlignTol ? doc["polygon_alignTol"].as<uint16_t>() : 0;
+  
+  // Manual move commands
+  int l = doc["l"] | 0;
+  int r = doc["r"] | 0;
+  int b = doc["b"] | 0;
+  bool hasManualMove = (l != 0 || r != 0 || b != 0);
+  
+  // NOW take mutex and update state quickly
+  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    
+    if (hasMode) state.mode = newMode;
+    if (hasNeighborMaxDist) state.neighbor_maxDist = newNeighborMaxDist;
+    if (hasIdleThresh) state.idle_thresh = newIdleThresh;
+    if (hasLineNodeDist) state.line_nodeDist = newLineNodeDist;
+    if (hasLineAlignTol) state.line_alignTol = newLineAlignTol;
+    if (hasPolygonSides) state.polygon_sides = newPolygonSides;
+    if (hasPolygonRadius) state.polygon_radius = newPolygonRadius;
+    if (hasPolygonAlignTol) state.polygon_alignTol = newPolygonAlignTol;
+    
+    xSemaphoreGive(stateMutex);
+    
+    Serial.println("State updated from MQTT");
   } else {
-    server.send(200, "text/plain",
-      "Robot Not In Manual Mode");
+    Serial.println("Failed to acquire mutex for state update");
+    return;
+  }
+  
+  // Execute motor commands AFTER releasing mutex
+  if (newMode == State::MANUAL && hasManualMove) {
+    setMotorSteps(l, r, b);
   }
 }
 
-void handleStatus() {
-  JsonDocument doc;
+void mqttReconnect() {
+  // Try to connect once, don't block
+  if(!mqttClient.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    
+    if(mqttClient.connect(hostname, mqtt_user, mqtt_password)) {
+      Serial.println("connected");
+      
+      char commandTopic[100];
+      char statusTopic[100];
+      snprintf(commandTopic, sizeof(commandTopic), "command/individual/%s", hostname);
+      snprintf(statusTopic, sizeof(statusTopic), "telemetry/%s/status", hostname);
 
-  doc["mode"]           = state.mode;
-  doc["idle_thresh"]    = state.idle_thresh;
-  doc["line_nodeDist"]  = state.line_nodeDist;
-  doc["line_alignTol"]  = state.line_alignTol;
-  doc["polygon_radius"] = state.polygon_radius;
-  doc["polygon_sides"]  = state.polygon_sides;
-  doc["polygon_alignTol"]= state.polygon_alignTol;
-  doc["neighbor_maxDist"]= state.neighbor_maxDist;
+      mqttClient.subscribe("command/broadcast");
+      mqttClient.subscribe(commandTopic);
 
-  JsonArray dist = doc["d"].to<JsonArray>();
-  for (int i = 0; i < 6; ++i) {
-    dist.add(state.distances[i]);
+      const char* pubConMsg = "Connected to MQTT";
+      mqttClient.publish(statusTopic, pubConMsg);
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" will retry in next cycle");
+    }
   }
+}
 
-  String json;
-  serializeJson(doc, json);
-  server.send(200, "application/json", json);
+void buildStatusPayload(char* buffer, size_t bufferSize) {
+  // Local copies of state variables
+  State::Mode mode;
+  uint16_t neighbor_maxDist;
+  uint16_t idle_thresh;
+  uint16_t line_nodeDist, line_alignTol;
+  uint8_t polygon_sides;
+  uint16_t polygon_radius, polygon_alignTol;
+  uint32_t distances[6];
+  
+  // Take mutex, copy data, release immediately
+  if(xSemaphoreTake(stateMutex, portMAX_DELAY) == pdTRUE) {
+    mode = state.mode;
+    neighbor_maxDist = state.neighbor_maxDist;
+    idle_thresh = state.idle_thresh;
+    line_nodeDist = state.line_nodeDist;
+    line_alignTol = state.line_alignTol;
+    polygon_sides = state.polygon_sides;
+    polygon_radius = state.polygon_radius;
+    polygon_alignTol = state.polygon_alignTol;
+    memcpy(distances, state.distances, sizeof(distances));
+    
+    xSemaphoreGive(stateMutex);
+  }
+  
+  // Build JSON with ArduinoJson
+  JsonDocument doc;
+  
+  // Mode as string
+  const char* modeStr;
+  switch(mode) {
+    case State::OFF: modeStr = "OFF"; break;
+    case State::IDLE: modeStr = "IDLE"; break;
+    case State::LINE: modeStr = "LINE"; break;
+    case State::POLYGON: modeStr = "POLYGON"; break;
+    case State::MANUAL: modeStr = "MANUAL"; break;
+    default: modeStr = "UNKNOWN"; break;
+  }
+  doc["mode"] = modeStr;
+  
+  // General parameters
+  doc["neighbor_maxDist"] = neighbor_maxDist;
+  
+  // Mode-specific parameters
+  switch(mode) {
+    case State::IDLE:
+      doc["idle_thresh"] = idle_thresh;
+      break;
+    case State::LINE:
+      doc["line_nodeDist"] = line_nodeDist;
+      doc["line_alignTol"] = line_alignTol;
+      break;
+    case State::POLYGON:
+      doc["polygon_sides"] = polygon_sides;
+      doc["polygon_radius"] = polygon_radius;
+      doc["polygon_alignTol"] = polygon_alignTol;
+      break;
+    default:
+      break;
+  }
+  
+  // Distance array
+  JsonArray distArray = doc["distances"].to<JsonArray>();
+  for (int i = 0; i < 6; i++) {
+    distArray.add(distances[i]);
+  }
+  
+  // Serialize to buffer
+  serializeJson(doc, buffer, bufferSize);
 }
 
 //-----------------------------------------------
-// Server Setup, Main Function Call, FreeRTOS Task
+// Server Setup, FreeRTOS Task
 void setupServer() {
-  // curl "http://esp32_s3.local/forward?steps=500"
-  server.on("/updateState", handleUpdateState);
-  server.on("/move",        handleMove);
-  server.on("/status", HTTP_GET, handleStatus);
+  mqttClient.setServer(mqtt_broker, mqtt_port);
+  mqttClient.setCallback(mqttCallback);
 
-  server.begin();
-}
-
-void handleServer() {
-  server.handleClient();
+  mqttReconnect();
 }
 
 // FreeRTOS Task
 void networkTask(void* parameter) {
-  const TickType_t xFrequency = pdMS_TO_TICKS(10); // Check every 10ms
-  
+  const TickType_t xFrequency = pdMS_TO_TICKS(10); // Check MQTT every 10ms
+
+  TickType_t lastStatusPublish = 0;
+  const TickType_t STATUS_PUBLISH_INTERVAL = pdMS_TO_TICKS(1000); // Publish status every 1 second
+
   while (true) {
-    ArduinoOTA.handle();
-    handleServer();
-    
-    vTaskDelay(xFrequency);
+      ArduinoOTA.handle();
+      if(!mqttClient.connected()) {
+        mqttReconnect();
+      }
+      mqttClient.loop();
+
+      // Only publish status periodically
+      TickType_t now = xTaskGetTickCount();
+      if (now - lastStatusPublish >= STATUS_PUBLISH_INTERVAL) {
+          char statusTopici[100];
+          snprintf(statusTopici, sizeof(statusTopici), "telemetry/%s/status", (char*)hostname);
+          
+          char statusData[512];
+          buildStatusPayload(statusData, sizeof(statusData));
+          
+          mqttClient.publish(statusTopici, statusData);
+          lastStatusPublish = now;
+      }
+
+      vTaskDelay(xFrequency);
   }
 }
